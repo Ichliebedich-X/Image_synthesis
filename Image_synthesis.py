@@ -412,6 +412,8 @@ class ImageCompositor:
         lp_blend = []
         for i in range(actual_levels + 1):
             m = mp_mask[i]
+            if m.ndim == 2:
+                m = m[:, :, np.newaxis]
             blended = m * lp_fg[i] + (1.0 - m) * lp_bg[i]
             lp_blend.append(blended)
 
