@@ -26,6 +26,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageTk
 import os
+import threading
 
 
 # ============================================================
@@ -601,8 +602,9 @@ class ImageCompositeApp:
     def __init__(self, root):
         self.root = root
         self.root.title("图像合成系统  |  数字图像处理大作业  |  南阳理工学院")
-        self.root.geometry("1280x780")
-        self.root.configure(bg='#f0f0f0')
+        self.root.geometry("1360x820")
+        self.root.minsize(1024, 680)
+        self.root.configure(bg='#f0f4f8')
 
         # 数据
         self.img_fg = None          # 前景图（BGR）
@@ -610,6 +612,14 @@ class ImageCompositeApp:
         self.fg_mask = None         # 前景掩码（float32, [0,1]）
         self.fg_mask_binary = None  # 前景掩码（uint8, 0/255）
         self.result = None          # 合成结果
+
+        # 缓存：避免重复预处理
+        self._cache_denoised_fg = None
+        self._cache_denoised_bg = None
+
+        # 线程控制
+        self._processing_thread = None
+        self._is_processing = False
 
         # 界面变量
         self.seg_method_var    = tk.StringVar(value='grabcut')
@@ -628,119 +638,186 @@ class ImageCompositeApp:
     # ─── 界面构建 ────────────────────────────────────────────
 
     def _build_ui(self):
-        # 标题栏
-        title_fr = tk.Frame(self.root, bg='#1a3c5e', height=48)
+        # ── 顶部标题栏 ──
+        title_fr = tk.Frame(self.root, bg='#1a3c5e', height=52)
         title_fr.pack(fill=tk.X); title_fr.pack_propagate(False)
-        tk.Label(title_fr, text="🖼  图像合成系统（传统算法）",
-                 font=('Microsoft YaHei', 13, 'bold'),
-                 fg='white', bg='#1a3c5e').pack(side=tk.LEFT, padx=20, pady=10)
+        tk.Label(title_fr, text=" 图像合成系统（传统算法）",
+                 font=('Microsoft YaHei', 14, 'bold'),
+                 fg='white', bg='#1a3c5e').pack(side=tk.LEFT, padx=22, pady=12)
 
-        # 主体
-        main = tk.Frame(self.root, bg='#f0f0f0')
+        # ── 进度条（初始隐藏，放置于控制面板中） ──
+        # 实际创建在 _build_control 中
+        self.progress = None
+
+        # ── 主体区域 ──
+        main = tk.Frame(self.root, bg='#f0f4f8')
         main.pack(fill=tk.BOTH, expand=True)
 
-        # 左侧控制面板
-        ctrl = tk.Frame(main, bg='#e8e8e8', width=260)
-        ctrl.pack(side=tk.LEFT, fill=tk.Y, padx=4, pady=4)
-        ctrl.pack_propagate(False)
-        self._build_control(ctrl)
+        # ── 左侧控制面板（含滚动条） ──
+        ctrl_canvas = tk.Canvas(main, bg='#e8edf2', width=300, highlightthickness=0)
+        ctrl_scroll = ttk.Scrollbar(main, orient=tk.VERTICAL, command=ctrl_canvas.yview)
+        ctrl_inner = tk.Frame(ctrl_canvas, bg='#e8edf2')
 
-        # 右侧图像区
-        disp = tk.Frame(main, bg='#f0f0f0')
-        disp.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4, pady=4)
+        ctrl_inner.bind('<Configure>',
+            lambda e: ctrl_canvas.configure(scrollregion=ctrl_canvas.bbox('all')))
+        ctrl_canvas.create_window((0, 0), window=ctrl_inner, anchor='nw', width=295)
+        ctrl_canvas.configure(yscrollcommand=ctrl_scroll.set)
+
+        ctrl_canvas.pack(side=tk.LEFT, fill=tk.Y, padx=(6, 0), pady=6)
+        ctrl_scroll.pack(side=tk.LEFT, fill=tk.Y, pady=6)
+        self._build_control(ctrl_inner)
+
+        # ── 右侧图像显示区 ──
+        disp = tk.Frame(main, bg='#f0f4f8')
+        disp.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=6, pady=6)
         self._build_display(disp)
 
-        # 状态栏
+        # ── 底部状态栏 ──
+        status_bg = '#1e3a5f'
         self.status = tk.StringVar(value="就绪。请加载前景图像和背景图像。")
-        tk.Label(self.root, textvariable=self.status,
-                 bd=1, relief=tk.SUNKEN, anchor=tk.W,
-                 font=('Microsoft YaHei', 9), fg='#333', bg='#dcdcdc').pack(
-            side=tk.BOTTOM, fill=tk.X)
+        status_frame = tk.Frame(self.root, bg=status_bg, height=32)
+        status_frame.pack(side=tk.BOTTOM, fill=tk.X); status_frame.pack_propagate(False)
+        tk.Label(status_frame, textvariable=self.status,
+                 anchor=tk.W, font=('Microsoft YaHei', 9),
+                 fg='#cfdfff', bg=status_bg).pack(side=tk.LEFT, padx=14, pady=4)
+        # 状态栏右侧提示
+        tk.Label(status_frame, text="南阳理工学院 · 数字图像处理大作业",
+                 font=('Microsoft YaHei', 8), fg='#6f8fc0', bg=status_bg).pack(
+            side=tk.RIGHT, padx=14, pady=4)
 
     def _build_control(self, parent):
-        def section(text): return ttk.LabelFrame(parent, text=text, padding=6)
+        """构建左侧控制面板——所有控件布局在此。"""
+        def section(text):
+            return ttk.LabelFrame(parent, text=text, padding=8)
 
-        # 文件操作
-        f1 = section("📁 加载图像"); f1.pack(fill=tk.X, padx=6, pady=4)
+        # ── 1. 加载图像 ──
+        f1 = section(" 加载图像"); f1.pack(fill=tk.X, padx=8, pady=(6, 3))
         self._btn(f1, "打开前景图像", self._open_fg, '#1a3c5e')
         self._btn(f1, "打开背景图像", self._open_bg, '#2e6b3e')
 
-        # 前景提取
-        f2 = section("✂️ 前景提取方法"); f2.pack(fill=tk.X, padx=6, pady=4)
+        # ── 2. 前景提取 ──
+        f2 = section(" 前景提取方法"); f2.pack(fill=tk.X, padx=8, pady=3)
         for lbl, val in [("GrabCut（推荐）", "grabcut"),
                           ("颜色阈值分割",   "color"),
                           ("Canny+形态学",   "canny")]:
             tk.Radiobutton(f2, text=lbl, variable=self.seg_method_var, value=val,
-                           bg='#e8e8e8', font=('Microsoft YaHei', 9)).pack(anchor=tk.W)
-        tk.Label(f2, text="背景颜色（颜色阈值用）:", bg='#e8e8e8',
-                 font=('Microsoft YaHei', 8)).pack(anchor=tk.W, pady=(4,0))
+                           bg='#e8edf2', font=('Microsoft YaHei', 9),
+                           activebackground='#d0d8e0').pack(anchor=tk.W, pady=1)
+        sep = tk.Frame(f2, bg='#c0c8d0', height=1); sep.pack(fill=tk.X, pady=4)
+        lbl_bg = tk.Label(f2, text="背景颜色（颜色阈值用）:",
+                          bg='#e8edf2', font=('Microsoft YaHei', 8))
+        lbl_bg.pack(anchor=tk.W, pady=(0, 2))
         bg_color_cb = ttk.Combobox(f2, textvariable=self.seg_bgcol_var,
                                    values=['auto','green','white','red','blue'],
-                                   width=12, state='readonly')
-        bg_color_cb.pack(anchor=tk.W)
-        self._btn(f2, "▶ 提取前景", self._extract_fg, '#7b3a00')
+                                   width=14, state='readonly')
+        bg_color_cb.pack(anchor=tk.W, pady=(0, 4))
+        self._btn(f2, "提取前景", self._extract_fg, '#7b3a00')
 
-        # 合成方法
-        f3 = section("🔀 合成方法"); f3.pack(fill=tk.X, padx=6, pady=4)
-        for lbl, val in [("加权Alpha混合",    "alpha"),
-                          ("拉普拉斯金字塔",   "laplacian"),
-                          ("颜色融合",         "color"),
-                          ("泊松融合",         "poisson")]:
+        # ── 3. 合成方法 ──
+        f3 = section(" 合成方法"); f3.pack(fill=tk.X, padx=8, pady=3)
+        for lbl, val in [("加权 Alpha 混合",    "alpha"),
+                          ("拉普拉斯金字塔融合", "laplacian"),
+                          ("颜色匹配融合",       "color"),
+                          ("泊松融合（无缝）",   "poisson")]:
             tk.Radiobutton(f3, text=lbl, variable=self.comp_method_var, value=val,
-                           bg='#e8e8e8', font=('Microsoft YaHei', 9)).pack(anchor=tk.W)
+                           bg='#e8edf2', font=('Microsoft YaHei', 9),
+                           activebackground='#d0d8e0').pack(anchor=tk.W, pady=1)
 
-        # 位置调节
-        f4 = section("📐 合成位置"); f4.pack(fill=tk.X, padx=6, pady=4)
-        for lbl, var in [("X偏移:", self.pos_x_var), ("Y偏移:", self.pos_y_var)]:
-            row = tk.Frame(f4, bg='#e8e8e8'); row.pack(fill=tk.X)
-            tk.Label(row, text=lbl, bg='#e8e8e8', font=('Microsoft YaHei', 8),
-                     width=7).pack(side=tk.LEFT)
+        # ── 4. 合成位置 ──
+        f4 = section(" 合成位置"); f4.pack(fill=tk.X, padx=8, pady=3)
+        for lbl, var in [("X 偏移:", self.pos_x_var), ("Y 偏移:", self.pos_y_var)]:
+            row = tk.Frame(f4, bg='#e8edf2'); row.pack(fill=tk.X, pady=1)
+            tk.Label(row, text=lbl, bg='#e8edf2', font=('Microsoft YaHei', 9),
+                     width=7, anchor=tk.E).pack(side=tk.LEFT)
             tk.Scale(row, variable=var, from_=0, to=500, orient=tk.HORIZONTAL,
-                     bg='#e8e8e8', length=160, font=('Microsoft YaHei', 7)).pack(side=tk.LEFT)
+                     bg='#e8edf2', troughcolor='#c0c8d0', length=180,
+                     font=('Microsoft YaHei', 7), sliderlength=18).pack(side=tk.LEFT, padx=4)
 
-        # 后处理参数
-        f5 = section("✨ 后处理增强"); f5.pack(fill=tk.X, padx=6, pady=4)
-        for lbl, var, lo, hi, res in [
+        # ── 5. 后处理增强 ──
+        f5 = section(" 后处理增强"); f5.pack(fill=tk.X, padx=8, pady=3)
+        params = [
             ("锐化强度:", self.sharp_var,      0, 2.0, 0.1),
             ("对比度:",   self.contrast_var,   0.5, 2.0, 0.05),
             ("亮度偏移:", self.brightness_var, -50, 50, 1),
             ("饱和度:",   self.sat_var,        0.5, 2.0, 0.05),
             ("暗角强度:", self.vignette_var,   0, 0.8, 0.05),
-        ]:
-            row = tk.Frame(f5, bg='#e8e8e8'); row.pack(fill=tk.X)
-            tk.Label(row, text=lbl, bg='#e8e8e8', font=('Microsoft YaHei', 8),
-                     width=8).pack(side=tk.LEFT)
+        ]
+        for lbl, var, lo, hi, res in params:
+            row = tk.Frame(f5, bg='#e8edf2'); row.pack(fill=tk.X, pady=1)
+            tk.Label(row, text=lbl, bg='#e8edf2', font=('Microsoft YaHei', 9),
+                     width=9, anchor=tk.E).pack(side=tk.LEFT)
             tk.Scale(row, variable=var, from_=lo, to=hi, resolution=res,
-                     orient=tk.HORIZONTAL, bg='#e8e8e8', length=150,
-                     font=('Microsoft YaHei', 7)).pack(side=tk.LEFT)
+                     orient=tk.HORIZONTAL, bg='#e8edf2', troughcolor='#c0c8d0',
+                     length=170, font=('Microsoft YaHei', 7),
+                     sliderlength=18).pack(side=tk.LEFT, padx=4)
 
-        # 执行按钮
-        self._btn(parent, "▶▶  开始合成", self._run_composite, '#c62828', pady=10)
-        self._btn(parent, "📊  方法对比", self._compare_all,    '#6a1b9a')
-        self._btn(parent, "🔬  展示流程", self._show_pipeline,  '#00695c')
-        self._btn(parent, "💾  保存结果", self._save_result,    '#1565c0')
+        # ── 6. 进度条 ──
+        self.progress = ttk.Progressbar(parent, mode='indeterminate', length=280)
+        # 不 pack，需要时再显示
 
-    def _btn(self, parent, text, cmd, color, pady=3):
-        tk.Button(parent, text=text, command=cmd, bg=color, fg='white',
-                  font=('Microsoft YaHei', 9), relief=tk.FLAT,
-                  cursor='hand2').pack(fill=tk.X, padx=6, pady=pady)
+        # ── 7. 操作按钮区 ──
+        sep2 = tk.Frame(parent, bg='#c0c8d0', height=1); sep2.pack(fill=tk.X, padx=8, pady=6)
+        btn_frame = tk.Frame(parent, bg='#e8edf2')
+        btn_frame.pack(fill=tk.X, padx=8, pady=(0, 8))
+        self.progress_btn_frame = btn_frame
+
+        self._btn(btn_frame, "开始合成", self._run_composite, '#c62828', pady=6)
+        self._btn(btn_frame, "四种方法对比", self._compare_all, '#6a1b9a', pady=4)
+        self._btn(btn_frame, "查看处理流程", self._show_pipeline, '#00695c', pady=4)
+        self._btn(btn_frame, "保存结果", self._save_result, '#1565c0', pady=6)
+
+    def _btn(self, parent, text, cmd, color, pady=4):
+        """统一创建样式一致的按钮。"""
+        btn = tk.Button(parent, text=text, command=cmd,
+                        bg=color, fg='white',
+                        activebackground=self._lighten_color(color, 0.2),
+                        activeforeground='white',
+                        font=('Microsoft YaHei', 9, 'bold'),
+                        relief=tk.FLAT, bd=0,
+                        cursor='hand2', padx=8)
+        btn.pack(fill=tk.X, padx=6, pady=pady, ipady=4)
+        return btn
+
+    @staticmethod
+    def _lighten_color(hex_color, factor=0.2):
+        """将十六进制颜色变亮，用于按钮 hover 效果。"""
+        hex_color = hex_color.lstrip('#')
+        r, g, b = int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16)
+        r = min(255, int(r + (255 - r) * factor))
+        g = min(255, int(g + (255 - g) * factor))
+        b = min(255, int(b + (255 - b) * factor))
+        return f'#{r:02x}{g:02x}{b:02x}'
 
     def _build_display(self, parent):
-        # 三格显示：前景 | 背景 | 结果
-        top = tk.Frame(parent, bg='#f0f0f0')
+        """构建右侧三格图片显示面板。"""
+        top = tk.Frame(parent, bg='#f0f4f8')
         top.pack(fill=tk.BOTH, expand=True)
 
         self.panels = {}
+        colors = {'fg': '#e3f0ff', 'bg': '#e8f5e9', 'result': '#fff3e0'}
         for title, key in [("前景图（原图）", "fg"),
                             ("背景图", "bg"),
                             ("合成结果", "result")]:
-            fr = ttk.LabelFrame(top, text=title, padding=4)
-            fr.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=3, pady=3)
-            lbl = tk.Label(fr, bg='#bbbbbb', text=f"（{title}）\n\n请加载图像",
-                           font=('Microsoft YaHei', 9), fg='#555')
+            # 外框：加浅色边框模拟卡片效果
+            outer = tk.Frame(top, bg='#ffffff', bd=1, relief=tk.SOLID)
+            outer.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+            fr = ttk.LabelFrame(outer, text=title, padding=6)
+            fr.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+
+            # 图片显示区域
+            lbl = tk.Label(fr, bg=colors[key], text=f"（{title}）\n\n请加载图像",
+                           font=('Microsoft YaHei', 10), fg='#666')
             lbl.pack(fill=tk.BOTH, expand=True)
-            info = tk.Label(fr, text="", font=('Microsoft YaHei', 8), bg='#f0f0f0')
-            info.pack()
+
+            # 底部分隔线 + 信息栏
+            sep_line = tk.Frame(fr, bg='#d0d8e0', height=1)
+            sep_line.pack(fill=tk.X)
+            info_bg = '#f5f5f5'
+            info = tk.Label(fr, text="等待加载……", font=('Microsoft YaHei', 8),
+                            bg=info_bg, fg='#888', anchor=tk.W)
+            info.pack(fill=tk.X, ipady=2)
+
             self.panels[key] = (lbl, info)
 
     # ─── 功能函数 ─────────────────────────────────────────────
@@ -765,139 +842,268 @@ class ImageCompositeApp:
         self._show(img, 'bg', os.path.basename(p))
         self.status.set(f"已加载背景：{os.path.basename(p)}  {img.shape[1]}×{img.shape[0]}")
 
+    def _set_controls_enabled(self, enabled):
+        """启用/禁用所有操作按钮，防止处理期间重复点击。"""
+        for child in self.progress_btn_frame.winfo_children():
+            if isinstance(child, tk.Button):
+                child.config(state=tk.NORMAL if enabled else tk.DISABLED)
+
+    def _show_progress(self, show=True):
+        """显示/隐藏进度条。"""
+        if show and self.progress is not None:
+            self.progress.pack(fill=tk.X, padx=8, pady=(0, 2))
+            self.progress.start(10)
+        elif self.progress is not None:
+            self.progress.stop()
+            self.progress.pack_forget()
+
     def _extract_fg(self):
+        """异步执行前景提取，避免阻塞界面。"""
         if self.img_fg is None:
             messagebox.showwarning("提示", "请先加载前景图像！"); return
+        if self._is_processing:
+            return
+
+        self._is_processing = True
+        self._set_controls_enabled(False)
+        self._show_progress(True)
         self.status.set("正在提取前景...")
-        self.root.update()
 
-        fg = Preprocessor.denoise(self.img_fg, 'bilateral')
-        method = self.seg_method_var.get()
+        def task():
+            try:
+                fg = Preprocessor.denoise(self.img_fg, 'bilateral')
+                self._cache_denoised_fg = fg
+                method = self.seg_method_var.get()
 
-        if method == 'grabcut':
-            mask_bin, _ = ForegroundExtractor.grabcut(fg)
-        elif method == 'color':
-            mask_bin = ForegroundExtractor.color_threshold(
-                fg, self.seg_bgcol_var.get())
-        else:
-            mask_bin = ForegroundExtractor.canny_morphology(fg)
+                if method == 'grabcut':
+                    mask_bin, _ = ForegroundExtractor.grabcut(fg)
+                elif method == 'color':
+                    mask_bin = ForegroundExtractor.color_threshold(
+                        fg, self.seg_bgcol_var.get())
+                else:
+                    mask_bin = ForegroundExtractor.canny_morphology(fg)
 
-        self.fg_mask_binary = mask_bin
-        self.fg_mask = ForegroundExtractor.refine_mask(mask_bin)
+                self.fg_mask_binary = mask_bin
+                self.fg_mask = ForegroundExtractor.refine_mask(mask_bin)
 
-        # 显示掩码叠加预览
-        preview = self.img_fg.copy()
-        preview[mask_bin == 0] = (preview[mask_bin == 0] * 0.3).astype(np.uint8)
-        self._show(preview, 'fg', f"前景掩码预览（{method}）")
-        self.status.set(f"前景提取完成（{method}）。非遮挡区域=前景，暗色区域=背景。")
+                preview = self.img_fg.copy()
+                preview[mask_bin == 0] = (preview[mask_bin == 0] * 0.3).astype(np.uint8)
+
+                def done():
+                    self._show(preview, 'fg', f"前景掩码预览（{method}）")
+                    self.status.set(f"前景提取完成（{method}）。非遮挡区域=前景，暗色区域=背景。")
+                    self._show_progress(False)
+                    self._set_controls_enabled(True)
+                    self._is_processing = False
+                self.root.after(0, done)
+            except Exception as e:
+                def err():
+                    messagebox.showerror("提取出错", str(e))
+                    self.status.set("前景提取失败")
+                    self._show_progress(False)
+                    self._set_controls_enabled(True)
+                    self._is_processing = False
+                self.root.after(0, err)
+
+        threading.Thread(target=task, daemon=True).start()
 
     def _run_composite(self):
+        """异步执行图像合成，避免阻塞界面。"""
         if self.img_fg is None or self.img_bg is None:
             messagebox.showwarning("提示", "请先加载前景和背景图像！"); return
+        if self._is_processing:
+            return
         if self.fg_mask is None:
-            self._extract_fg()
+            messagebox.showwarning("提示", "请先点击「提取前景」提取前景掩码！")
+            return
 
-        self.status.set("合成中...")
-        self.root.update()
+        self._is_processing = True
+        self._set_controls_enabled(False)
+        self._show_progress(True)
+        self.status.set("正在合成中，请稍候...")
 
-        fg = Preprocessor.denoise(self.img_fg, 'bilateral')
-        fg = Preprocessor.resize_to_match(fg, self.img_bg)
-        # 同步缩放掩码到与前景一致
-        mh, mw = self.fg_mask.shape[:2]
-        fh, fw = fg.shape[:2]
-        if (mh, mw) != (fh, fw):
-            mask_b = cv2.resize(self.fg_mask_binary, (fw, fh))
-            mask_f = cv2.resize(self.fg_mask,        (fw, fh))
-        else:
-            mask_b, mask_f = self.fg_mask_binary, self.fg_mask
+        def task():
+            try:
+                # 使用缓存的去噪结果，避免重复计算
+                fg = self._cache_denoised_fg if self._cache_denoised_fg is not None else \
+                     Preprocessor.denoise(self.img_fg, 'bilateral')
+                fg_resized = Preprocessor.resize_to_match(fg, self.img_bg)
 
-        pos = (self.pos_x_var.get(), self.pos_y_var.get())
-        method = self.comp_method_var.get()
+                # 同步缩放掩码到与前景一致
+                mh, mw = self.fg_mask.shape[:2]
+                fh, fw = fg_resized.shape[:2]
+                if (mh, mw) != (fh, fw):
+                    mask_b = cv2.resize(self.fg_mask_binary, (fw, fh))
+                    mask_f = cv2.resize(self.fg_mask,        (fw, fh))
+                else:
+                    mask_b, mask_f = self.fg_mask_binary, self.fg_mask
 
-        if method == 'alpha':
-            result = ImageCompositor.alpha_blend(fg, self.img_bg, mask_f, pos)
-        elif method == 'laplacian':
-            result = ImageCompositor.laplacian_pyramid_blend(
-                fg, self.img_bg, mask_f, pos)
-        elif method == 'color':
-            result = ImageCompositor.color_match_blend(
-                fg, self.img_bg, mask_f, pos)
-        else:  # poisson
-            result = ImageCompositor.poisson_blend(
-                fg, self.img_bg, mask_b, pos)
+                pos = (self.pos_x_var.get(), self.pos_y_var.get())
+                method = self.comp_method_var.get()
 
-        # 后处理
-        result = PostProcessor.adjust_contrast_brightness(
-            result, self.contrast_var.get(), self.brightness_var.get())
-        if self.sharp_var.get() > 0:
-            result = PostProcessor.sharpen(result, self.sharp_var.get())
-        if self.sat_var.get() != 1.0:
-            result = PostProcessor.color_adjust(result, sat_scale=self.sat_var.get())
-        if self.vignette_var.get() > 0:
-            result = PostProcessor.vignette(result, self.vignette_var.get())
+                if method == 'alpha':
+                    result = ImageCompositor.alpha_blend(fg_resized, self.img_bg, mask_f, pos)
+                elif method == 'laplacian':
+                    result = ImageCompositor.laplacian_pyramid_blend(
+                        fg_resized, self.img_bg, mask_f, pos)
+                elif method == 'color':
+                    result = ImageCompositor.color_match_blend(
+                        fg_resized, self.img_bg, mask_f, pos)
+                else:  # poisson
+                    result = ImageCompositor.poisson_blend(
+                        fg_resized, self.img_bg, mask_b, pos)
 
-        self.result = result
-        self._show(result, 'result', f"合成结果（{method}）")
-        self.status.set(f"合成完成！方法：{method} | 位置：{pos} | 点击【保存结果】导出")
+                # 后处理
+                result = PostProcessor.adjust_contrast_brightness(
+                    result, self.contrast_var.get(), self.brightness_var.get())
+                if self.sharp_var.get() > 0:
+                    result = PostProcessor.sharpen(result, self.sharp_var.get())
+                if self.sat_var.get() != 1.0:
+                    result = PostProcessor.color_adjust(result, sat_scale=self.sat_var.get())
+                if self.vignette_var.get() > 0:
+                    result = PostProcessor.vignette(result, self.vignette_var.get())
+
+                def done():
+                    self.result = result
+                    self._show(result, 'result', f"合成结果（{method}）")
+                    self.status.set(f"合成完成！方法：{method} | 位置：{pos}")
+                    self._show_progress(False)
+                    self._set_controls_enabled(True)
+                    self._is_processing = False
+                self.root.after(0, done)
+            except Exception as e:
+                def err():
+                    messagebox.showerror("合成出错", str(e))
+                    self.status.set("合成失败")
+                    self._show_progress(False)
+                    self._set_controls_enabled(True)
+                    self._is_processing = False
+                self.root.after(0, err)
+
+        threading.Thread(target=task, daemon=True).start()
 
     def _compare_all(self):
+        """异步对比四种合成方法，在弹出窗口中展示。"""
         if self.img_fg is None or self.img_bg is None:
             messagebox.showwarning("提示", "请先加载前景和背景图像！"); return
+        if self._is_processing:
+            return
         if self.fg_mask is None:
-            self._extract_fg()
+            messagebox.showwarning("提示", "请先点击「提取前景」提取前景掩码！")
+            return
 
-        fg = Preprocessor.resize_to_match(
-            Preprocessor.denoise(self.img_fg, 'bilateral'), self.img_bg)
-        fh, fw = fg.shape[:2]
-        mask_b = cv2.resize(self.fg_mask_binary, (fw, fh))
-        mask_f = cv2.resize(self.fg_mask,        (fw, fh))
-        pos = (self.pos_x_var.get(), self.pos_y_var.get())
+        self._is_processing = True
+        self._set_controls_enabled(False)
+        self._show_progress(True)
+        self.status.set("正在对比四种合成方法...")
 
-        win = tk.Toplevel(self.root); win.title("四种合成方法效果对比")
-        win.geometry("960x480"); win.configure(bg='#f0f0f0')
-        tk.Label(win, text="四种合成方法对比", font=('Microsoft YaHei',11,'bold'),
-                 bg='#f0f0f0').pack(pady=6)
-        row = tk.Frame(win, bg='#f0f0f0'); row.pack(fill=tk.BOTH, expand=True, padx=8)
+        def task():
+            try:
+                fg = self._cache_denoised_fg if self._cache_denoised_fg is not None else \
+                     Preprocessor.denoise(self.img_fg, 'bilateral')
+                fg = Preprocessor.resize_to_match(fg, self.img_bg)
+                fh, fw = fg.shape[:2]
+                mask_b = cv2.resize(self.fg_mask_binary, (fw, fh))
+                mask_f = cv2.resize(self.fg_mask,        (fw, fh))
+                pos = (self.pos_x_var.get(), self.pos_y_var.get())
 
-        methods = [('Alpha混合', 'alpha'), ('Laplacian金字塔', 'laplacian'),
-                   ('颜色融合',  'color'), ('泊松融合',        'poisson')]
-        for name, m in methods:
-            if m == 'alpha':     res = ImageCompositor.alpha_blend(fg, self.img_bg, mask_f, pos)
-            elif m == 'laplacian': res = ImageCompositor.laplacian_pyramid_blend(fg, self.img_bg, mask_f, pos)
-            elif m == 'color':   res = ImageCompositor.color_match_blend(fg, self.img_bg, mask_f, pos)
-            else:                res = ImageCompositor.poisson_blend(fg, self.img_bg, mask_b, pos)
-            fr = ttk.LabelFrame(row, text=name, padding=4)
-            fr.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=3)
-            lbl = tk.Label(fr, bg='#cccccc'); lbl.pack(fill=tk.BOTH, expand=True)
-            self._show_in(res, lbl, 200)
+                methods = [('Alpha 混合', 'alpha'),
+                           ('Laplacian 金字塔', 'laplacian'),
+                           ('颜色匹配融合', 'color'),
+                           ('泊松融合（无缝）', 'poisson')]
+                results_data = []
+                for name, m in methods:
+                    if m == 'alpha':
+                        res = ImageCompositor.alpha_blend(fg, self.img_bg, mask_f, pos)
+                    elif m == 'laplacian':
+                        res = ImageCompositor.laplacian_pyramid_blend(fg, self.img_bg, mask_f, pos)
+                    elif m == 'color':
+                        res = ImageCompositor.color_match_blend(fg, self.img_bg, mask_f, pos)
+                    else:
+                        res = ImageCompositor.poisson_blend(fg, self.img_bg, mask_b, pos)
+                    results_data.append((name, res))
+
+                def done():
+                    win = tk.Toplevel(self.root)
+                    win.title("四种合成方法效果对比")
+                    win.geometry("1100x520")
+                    win.configure(bg='#f0f4f8')
+                    win.minsize(800, 400)
+
+                    header_bg = tk.Frame(win, bg='#1a3c5e', height=40)
+                    header_bg.pack(fill=tk.X); header_bg.pack_propagate(False)
+                    tk.Label(header_bg, text="四种合成方法效果对比",
+                             font=('Microsoft YaHei', 12, 'bold'),
+                             fg='white', bg='#1a3c5e').pack(pady=8)
+
+                    row = tk.Frame(win, bg='#f0f4f8')
+                    row.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+                    for name, res in results_data:
+                        fr = ttk.LabelFrame(row, text=name, padding=6)
+                        fr.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4)
+                        lbl = tk.Label(fr, bg='#e8edf2')
+                        lbl.pack(fill=tk.BOTH, expand=True)
+                        self._show_in(res, lbl, 240)
+
+                    self.status.set("方法对比完成")
+                    self._show_progress(False)
+                    self._set_controls_enabled(True)
+                    self._is_processing = False
+                self.root.after(0, done)
+            except Exception as e:
+                def err():
+                    messagebox.showerror("对比出错", str(e))
+                    self._show_progress(False)
+                    self._set_controls_enabled(True)
+                    self._is_processing = False
+                self.root.after(0, err)
+
+        threading.Thread(target=task, daemon=True).start()
 
     def _show_pipeline(self):
+        """展示处理流程各阶段中间结果。"""
         if self.img_fg is None or self.img_bg is None:
             messagebox.showwarning("提示", "请先加载前景和背景！"); return
         if self.fg_mask is None:
-            self._extract_fg()
+            messagebox.showwarning("提示", "请先点击「提取前景」提取前景掩码！")
+            return
 
         steps = Preprocessor.get_steps(self.img_fg, self.img_bg)
-        win = tk.Toplevel(self.root); win.title("处理流程中间步骤")
-        win.geometry("1100x580"); win.configure(bg='#f0f0f0')
-        tk.Label(win, text="图像合成处理流程：各阶段中间结果",
-                 font=('Microsoft YaHei',11,'bold'), bg='#f0f0f0').pack(pady=6)
+        win = tk.Toplevel(self.root)
+        win.title("处理流程中间步骤")
+        bg_color = '#f0f4f8'
+        win.geometry("1160x640")
+        win.configure(bg=bg_color)
+        win.minsize(900, 500)
 
-        # 预处理行
-        r1 = tk.Frame(win, bg='#f0f0f0'); r1.pack(fill=tk.X, padx=8)
-        tk.Label(r1, text="【预处理】", font=('Microsoft YaHei',9,'bold'),
-                 fg='#1565c0', bg='#f0f0f0').pack(anchor=tk.W)
-        rf = tk.Frame(r1, bg='#f0f0f0'); rf.pack(fill=tk.X)
+        # 标题栏
+        header = tk.Frame(win, bg='#1a3c5e', height=38)
+        header.pack(fill=tk.X); header.pack_propagate(False)
+        tk.Label(header, text="图像合成处理流程 — 各阶段中间结果",
+                 font=('Microsoft YaHei', 11, 'bold'),
+                 fg='white', bg='#1a3c5e').pack(pady=7)
+
+        body = tk.Frame(win, bg=bg_color)
+        body.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
+
+        # ── 预处理行 ──
+        r1 = tk.Frame(body, bg=bg_color); r1.pack(fill=tk.X, pady=(0, 6))
+        tk.Label(r1, text="【预处理】", font=('Microsoft YaHei', 10, 'bold'),
+                 fg='#1565c0', bg=bg_color).pack(anchor=tk.W, pady=(0, 2))
+        rf = tk.Frame(r1, bg=bg_color); rf.pack(fill=tk.X)
         for title, img in steps.items():
-            f = ttk.LabelFrame(rf, text=title, padding=3); f.pack(side=tk.LEFT, padx=3)
-            lbl = tk.Label(f, bg='#ccc'); lbl.pack()
-            self._show_in(img, lbl, 150)
+            f = ttk.LabelFrame(rf, text=title, padding=4)
+            f.pack(side=tk.LEFT, padx=3, ipady=2)
+            lbl = tk.Label(f, bg='#e3f0ff')
+            lbl.pack()
+            self._show_in(img, lbl, 160)
 
-        # 分割行
-        r2 = tk.Frame(win, bg='#f0f0f0'); r2.pack(fill=tk.X, padx=8, pady=(8,0))
-        tk.Label(r2, text="【前景提取】", font=('Microsoft YaHei',9,'bold'),
-                 fg='#1b5e20', bg='#f0f0f0').pack(anchor=tk.W)
-        rf2 = tk.Frame(r2, bg='#f0f0f0'); rf2.pack(fill=tk.X)
+        # ── 分割行 ──
+        r2 = tk.Frame(body, bg=bg_color); r2.pack(fill=tk.X, pady=6)
+        tk.Label(r2, text="【前景提取】", font=('Microsoft YaHei', 10, 'bold'),
+                 fg='#1b5e20', bg=bg_color).pack(anchor=tk.W, pady=(0, 2))
+        rf2 = tk.Frame(r2, bg=bg_color); rf2.pack(fill=tk.X)
         fg_pre = Preprocessor.denoise(self.img_fg, 'bilateral')
         mask_vis = cv2.cvtColor(self.fg_mask_binary, cv2.COLOR_GRAY2BGR)
         fg_on_mask = self.img_fg.copy()
@@ -906,43 +1112,129 @@ class ImageCompositeApp:
         for title, img in [("前景预处理", fg_pre),
                             ("分割掩码",   mask_vis),
                             ("前景提取效果", fg_on_mask)]:
-            f = ttk.LabelFrame(rf2, text=title, padding=3); f.pack(side=tk.LEFT, padx=3)
-            lbl = tk.Label(f, bg='#ccc'); lbl.pack()
-            self._show_in(img, lbl, 150)
+            f = ttk.LabelFrame(rf2, text=title, padding=4)
+            f.pack(side=tk.LEFT, padx=3)
+            lbl = tk.Label(f, bg='#e8f5e9')
+            lbl.pack()
+            self._show_in(img, lbl, 160)
 
-        # 合成结果行
-        r3 = tk.Frame(win, bg='#f0f0f0'); r3.pack(fill=tk.X, padx=8, pady=(8,0))
-        tk.Label(r3, text="【合成与后处理】", font=('Microsoft YaHei',9,'bold'),
-                 fg='#b71c1c', bg='#f0f0f0').pack(anchor=tk.W)
-        rf3 = tk.Frame(r3, bg='#f0f0f0'); rf3.pack(fill=tk.X)
+        # ── 合成结果行 ──
+        r3 = tk.Frame(body, bg=bg_color); r3.pack(fill=tk.X, pady=6)
+        tk.Label(r3, text="【合成与后处理】", font=('Microsoft YaHei', 10, 'bold'),
+                 fg='#b71c1c', bg=bg_color).pack(anchor=tk.W, pady=(0, 2))
+        rf3 = tk.Frame(r3, bg=bg_color); rf3.pack(fill=tk.X)
         items = [("背景图", self.img_bg)]
         if self.result is not None:
             items += [("合成结果", self.result)]
         for title, img in items:
-            f = ttk.LabelFrame(rf3, text=title, padding=3); f.pack(side=tk.LEFT, padx=3)
-            lbl = tk.Label(f, bg='#ccc'); lbl.pack()
-            self._show_in(img, lbl, 200)
+            f = ttk.LabelFrame(rf3, text=title, padding=4)
+            f.pack(side=tk.LEFT, padx=3)
+            lbl = tk.Label(f, bg='#fff3e0')
+            lbl.pack()
+            self._show_in(img, lbl, 220)
 
     def _save_result(self):
+        """增强版保存：先预览确认，再保存文件。"""
         if self.result is None:
             messagebox.showwarning("提示", "请先运行合成！"); return
-        p = filedialog.asksaveasfilename(
-            title="保存合成结果", defaultextension=".png",
-            filetypes=[("PNG","*.png"),("JPEG","*.jpg"),("全部","*.*")])
-        if p:
-            cv2.imwrite(p, self.result)
-            messagebox.showinfo("成功", f"已保存：{p}")
-            self.status.set(f"已保存：{p}")
+
+        # 计算文件信息
+        h, w = self.result.shape[:2]
+        est_size = w * h * 3 / 1024  # 近似 KB（BGR 3通道）
+
+        # 弹出保存前预览对话框
+        preview_win = tk.Toplevel(self.root)
+        preview_win.title("保存合成结果 - 预览确认")
+        preview_win.geometry("480x420")
+        preview_win.configure(bg='#f0f4f8')
+        preview_win.resizable(False, False)
+        preview_win.transient(self.root)
+        preview_win.grab_set()
+
+        tk.Label(preview_win, text="保存前预览",
+                 font=('Microsoft YaHei', 12, 'bold'),
+                 bg='#f0f4f8', fg='#1a3c5e').pack(pady=(10, 4))
+
+        # 缩略图
+        preview_img = cv2.cvtColor(self.result, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(preview_img)
+        pil_img.thumbnail((320, 200), Image.LANCZOS)
+        photo = ImageTk.PhotoImage(pil_img)
+        img_lbl = tk.Label(preview_win, image=photo, bg='#ffffff',
+                           bd=1, relief=tk.SOLID)
+        img_lbl.image = photo
+        img_lbl.pack(pady=6)
+
+        # 信息面板
+        info_fr = tk.Frame(preview_win, bg='#e8edf2', bd=1, relief=tk.SOLID)
+        info_fr.pack(fill=tk.X, padx=30, pady=6)
+        info_text = (
+            f"尺寸：{w} × {h} 像素\n"
+            f"通道：BGR（3通道）\n"
+            f"估计文件大小：{est_size:.0f} KB（PNG） / {est_size//3:.0f} KB（JPEG）\n"
+            f"当前合成方法：{self.comp_method_var.get()}"
+        )
+        tk.Label(info_fr, text=info_text, bg='#e8edf2',
+                 font=('Microsoft YaHei', 9), fg='#333',
+                 justify=tk.LEFT, anchor=tk.W).pack(padx=12, pady=8, fill=tk.X)
+
+        # 按钮区
+        btn_fr = tk.Frame(preview_win, bg='#f0f4f8')
+        btn_fr.pack(fill=tk.X, padx=30, pady=(6, 12))
+
+        user_choice = {'path': None}
+
+        def on_confirm():
+            preview_win.destroy()
+            p = filedialog.asksaveasfilename(
+                title="保存合成结果", defaultextension=".png",
+                filetypes=[("PNG 图片", "*.png"),
+                           ("JPEG 图片", "*.jpg"),
+                           ("BMP 图片", "*.bmp"),
+                           ("全部文件", "*.*")])
+            if p:
+                user_choice['path'] = p
+
+        def on_cancel():
+            preview_win.destroy()
+
+        tk.Button(btn_fr, text="选择路径并保存", command=on_confirm,
+                  bg='#1565c0', fg='white', font=('Microsoft YaHei', 9, 'bold'),
+                  activebackground='#1976d2', activeforeground='white',
+                  relief=tk.FLAT, padx=12, cursor='hand2').pack(side=tk.LEFT, padx=4)
+        tk.Button(btn_fr, text="取消", command=on_cancel,
+                  bg='#888888', fg='white', font=('Microsoft YaHei', 9),
+                  activebackground='#999999', activeforeground='white',
+                  relief=tk.FLAT, padx=12, cursor='hand2').pack(side=tk.RIGHT, padx=4)
+
+        self.root.wait_window(preview_win)
+
+        p = user_choice['path']
+        if not p:
+            return
+
+        success = cv2.imwrite(p, self.result)
+        if success:
+            file_size = os.path.getsize(p) / 1024
+            messagebox.showinfo("保存成功",
+                f"文件已保存至：\n{p}\n\n"
+                f"文件大小：{file_size:.1f} KB\n"
+                f"图像尺寸：{w} × {h}")
+            self.status.set(f"已保存：{os.path.basename(p)} ({file_size:.0f} KB)")
+        else:
+            messagebox.showerror("保存失败", "无法写入文件，请检查路径权限。")
 
     # ─── 辅助 ──────────────────────────────────────────────────
 
     def _show(self, img, key, name=""):
+        """在主面板中显示图像并更新底部信息。"""
         lbl, info = self.panels[key]
         self._show_in(img, lbl)
         h, w = img.shape[:2]
-        info.config(text=f"{w}×{h}  {name}")
+        info.config(text=f"{w} × {h}  {name}")
 
     def _show_in(self, img, label, max_size=None):
+        """将 OpenCV BGR 图像缩放到 Label 中显示，保持宽高比。"""
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         pil = Image.fromarray(rgb)
         if max_size:
@@ -950,10 +1242,10 @@ class ImageCompositeApp:
         else:
             label.update_idletasks()
             w = label.winfo_width() or 380
-            h = label.winfo_height() or 300
-            pil.thumbnail((w-8, h-8), Image.LANCZOS)
+            h = label.winfo_height() or 280
+            pil.thumbnail((w - 10, h - 10), Image.LANCZOS)
         photo = ImageTk.PhotoImage(pil)
-        label.config(image=photo, text='')
+        label.config(image=photo, text='', bg='#ffffff')
         label.image = photo
 
 
@@ -966,6 +1258,20 @@ def main():
     try:
         style = ttk.Style(root)
         style.theme_use('clam')
+        # 自定义 LabelFrame 样式
+        style.configure('TLabelframe', background='#e8edf2', relief=tk.FLAT, bd=0)
+        style.configure('TLabelframe.Label', background='#e8edf2',
+                        font=('Microsoft YaHei', 9, 'bold'), foreground='#1a3c5e')
+        # 自定义 Combobox 样式
+        style.configure('TCombobox', font=('Microsoft YaHei', 9), fieldbackground='white')
+        # 自定义 Progressbar 样式
+        style.configure('Horizontal.TProgressbar', background='#1565c0',
+                        troughcolor='#d0d8e0', bordercolor='#e8edf2',
+                        lightcolor='#42a5f5', darkcolor='#1565c0')
+        # 自定义 Scrollbar 样式
+        style.configure('Vertical.TScrollbar', background='#c0c8d0',
+                        troughcolor='#e8edf2', bordercolor='#e8edf2',
+                        arrowcolor='#555555')
     except Exception:
         pass
     app = ImageCompositeApp(root)
